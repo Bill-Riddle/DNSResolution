@@ -226,13 +226,23 @@ function Get-TargetDnsData {
                 Get-Content $hostsPath -ErrorAction SilentlyContinue |
                     Where-Object { $_ -notmatch '^\s*#' -and $_ -match '\S' } |
                     ForEach-Object {
-                        $parts = ($_ -split '\s+', 3)
-                        if ($parts.Count -ge 2) {
-                            [PSCustomObject]@{
-                                IPAddress = $parts[0].Trim()
-                                Hostname  = $parts[1].Trim()
-                                Comment   = if ($parts.Count -gt 2) { $parts[2] } else { '' }
-                                RawLine   = $_
+                        $rawLine = $_
+                        # Split on whitespace; tokens starting with '#' begin an inline comment
+                        $tokens = ($rawLine -split '\s+') | Where-Object { $_ -ne '' }
+                        if ($tokens.Count -ge 2 -and $tokens[0] -notmatch '^#') {
+                            $ip = $tokens[0].Trim()
+                            # Collect all alias tokens up to (but not including) any inline comment
+                            $aliases = @()
+                            for ($i = 1; $i -lt $tokens.Count; $i++) {
+                                if ($tokens[$i] -match '^#') { break }
+                                $aliases += $tokens[$i].Trim()
+                            }
+                            foreach ($alias in $aliases) {
+                                [PSCustomObject]@{
+                                    IPAddress = $ip
+                                    Hostname  = $alias
+                                    RawLine   = $rawLine
+                                }
                             }
                         }
                     } | Where-Object { $_ -ne $null }
@@ -297,11 +307,15 @@ function Get-TargetDnsData {
             $data.DnsServers | ForEach-Object { $_.ServerAddresses } | Select-Object -Unique
         )
 
-        # Choose a test name relevant to the machine's context
+        # Choose a test name relevant to the machine's context.
+        # For domain-joined machines, use the AD domain name (resolvable by any internal DNS server).
+        # For workgroup machines, use the machine's own hostname rather than an internet name —
+        # internal-only resolvers (Pi-hole, split-horizon, air-gapped) cannot resolve
+        # dns.msftncsi.com and would be incorrectly flagged as unhealthy.
         $testName = if ($data.ComputerSystem.PartOfDomain -and $data.ComputerSystem.Domain) {
             $data.ComputerSystem.Domain
         } else {
-            'dns.msftncsi.com'
+            $data.ComputerSystem.Name
         }
 
         $data.ServerTests = @{}
@@ -470,7 +484,7 @@ function Invoke-DnsAnalysis {
     # Flag domain-related entries in hosts (potential DNS hijack / split-brain indicator)
     if ($Data.ComputerSystem.PartOfDomain -and $Data.ComputerSystem.Domain) {
         $domain       = $Data.ComputerSystem.Domain
-        $domainInHosts = @($nonLoopback | Where-Object { $_.Hostname -match [regex]::Escape($domain) })
+        $domainInHosts = @($nonLoopback | Where-Object { $_.Hostname -match "(?i)(^|\.)$([regex]::Escape($domain))$" })
         if ($domainInHosts.Count -gt 0) {
             $names = ($domainInHosts | ForEach-Object { $_.Hostname }) -join ', '
             Add-Finding $script:SEV_CRITICAL 'Hosts File' `
@@ -520,7 +534,7 @@ function Invoke-DnsAnalysis {
             Add-Finding $script:SEV_WARN 'PTR Record' `
                 "No PTR (reverse DNS) record found for $ip. Missing PTR records cause failures in some applications, SMTP, and security auditing tools." `
                 "Create a PTR record in the reverse lookup zone for $ip, or run 'ipconfig /registerdns' if dynamic DNS updates are enabled."
-        } elseif ($ptr.NameHost -and ($ptr.NameHost -notmatch "(?i)$([regex]::Escape($hostname))")) {
+        } elseif ($ptr.NameHost -and ($ptr.NameHost -notmatch "(?i)^$([regex]::Escape($hostname))(\.|\s*$)")) {
             Add-Finding $script:SEV_WARN 'PTR Record' `
                 "PTR record for $ip resolves to '$($ptr.NameHost)', not '$hostname'. This is a stale or incorrect reverse record." `
                 "Delete the PTR record for $ip and run 'ipconfig /registerdns' to re-register the correct reverse record."
